@@ -25,6 +25,15 @@
 
 static int ngx_http_lua_socket_tcp(lua_State *L);
 static int ngx_http_lua_socket_tcp_connect(lua_State *L);
+static int ngx_http_lua_socket_connect(lua_State *L);
+
+#if (NGX_SSL)
+static int ngx_http_lua_socket_ssl(lua_State *L);
+static int ngx_http_lua_socket_ssl_wrap(lua_State *L);
+static long ngx_http_lua_socket_ssl_option_handler(u_char *s, size_t len);
+static void ngx_http_lua_socket_ssl_handshake(ngx_connection_t *c);
+#endif
+
 static int ngx_http_lua_socket_tcp_receive(lua_State *L);
 static int ngx_http_lua_socket_tcp_send(lua_State *L);
 static int ngx_http_lua_socket_tcp_close(lua_State *L);
@@ -122,7 +131,11 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 {
     ngx_int_t         rc;
 
+#if (NGX_SSL)
+    lua_createtable(L, 0, 4 /* nrec */);    /* ngx.socket w/ ssl */
+#else
     lua_createtable(L, 0, 3 /* nrec */);    /* ngx.socket */
+#endif
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp);
     lua_setfield(L, -2, "tcp");
@@ -143,6 +156,26 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
     } else {
         lua_setfield(L, -2, "connect");
     }
+
+#if (NGX_SSL)
+    lua_createtable(L, 0, 1);   /* ngx.socket.ssl */
+
+    lua_pushcfunction(L, ngx_http_lua_socket_ssl_wrap);
+    lua_setfield(L, -2, "wrap");
+
+    /* {{{ssl object metatable */
+
+    lua_createtable(L, 0 /* narr */, 1 /* nrec */);
+
+    lua_pushcfunction(L, ngx_http_lua_socket_ssl);
+    lua_setfield(L, -2, "__call");  /* ngx.socket.ssl() */
+
+    lua_setmetatable(L, -2);
+
+    /* }}} */
+
+    lua_setfield(L, -2, "ssl");
+#endif
 
     lua_setfield(L, -2, "socket");
 
@@ -583,6 +616,327 @@ ngx_http_lua_socket_tcp_connect(lua_State *L)
 
     return lua_yield(L, 0);
 }
+
+
+static int
+ngx_http_lua_socket_connect(lua_State *L)
+{
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp);
+    lua_call(L, 0, 1);
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_connect);
+    lua_call(L, lua_gettop(L), 2);
+
+    if (!lua_isnil(L, -2)) {
+        return 1;
+    }
+
+    return 2;
+}
+
+
+#if (NGX_SSL)
+static int
+ngx_http_lua_socket_ssl(lua_State *L)
+{
+    if (lua_gettop(L) > 1) {
+        return luaL_error(L, "expecting up to 1 argument, but got %d",
+                         lua_gettop(L));
+    }
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp);
+    lua_call(L, 0, 1);
+
+    lua_pushcfunction(L, ngx_http_lua_socket_ssl_wrap);
+    lua_call(L, lua_gettop(L), 1);
+
+    return 1;
+}
+
+
+static int
+ngx_http_lua_socket_ssl_wrap(lua_State *L)
+{
+    char verify_flag = 0;
+
+    long options_flag = 0;
+    u_char                          *op;
+    size_t                          len;
+
+    ngx_http_lua_socket_tcp_upstream_t  *u;
+    ngx_peer_connection_t           *tcp_pc;
+    ngx_connection_t                *c;
+    ngx_ssl_t                       *ssl;
+    ngx_peer_connection_t       *pc;
+
+    ngx_int_t                       rc;
+
+    int argc = lua_gettop(L);
+
+    if (argc > 2) {
+        return luaL_error(L, "expecting 1 or 2 arguments, but got %d", argc);
+    }
+
+
+    if (argc == 2 && !lua_istable(L, 2)) {
+        return luaL_error(L, "expecting table as second argument, but got"
+                             " %s", luaL_typename(L, 2));
+    }
+
+    lua_rawgeti(L, 1, SOCKET_CTX_INDEX);
+    u = lua_touserdata(L, -1);
+    lua_pop(L, 1);
+
+    if (u == NULL) {
+        return luaL_error(L, "invalid TCP object, unable to get context");
+    }
+
+    pc = &u->peer;
+    c = pc->connection;
+    ssl = &u->ssl;
+
+    ssl->log = pc->log;
+
+    if (ngx_ssl_create(ssl, NGX_SSL_SSLv2|NGX_SSL_SSLv3|NGX_SSL_TLSv1
+                                         |NGX_SSL_TLSv1_1|NGX_SSL_TLSv1_2, NULL)
+       != NGX_OK)
+    {
+        return luaL_error(L, "unable to create SSL context");
+    }
+
+
+    if (argc == 2) {
+
+        lua_getfield(L, 2, "key");
+        if (lua_isstring(L, -1)) {
+            /* TODO: implement the key option */
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "certificate");
+        if (lua_isstring(L, -1)) {
+            /* TODO: implement the certificate option */
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "ca");
+        if (lua_isstring(L, -1)) {
+            /* TODO: implement the certificate authority option */
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "verify");
+        if (lua_istable(L, -1)) {
+
+            lua_pushnil(L); /* nil key for first item */
+            while (lua_next(L, -2) != 0) { /* iterate */
+                op = (u_char *) lua_tolstring(L, -1, &len);
+
+                switch (ngx_murmur_hash2(op,len)) {
+                    /* none */
+                    case 0x3BDD4DB2:
+                        verify_flag |= SSL_VERIFY_NONE; break;
+                    /* peer */
+                    case 0x8AD26DA4:
+                        verify_flag |= SSL_VERIFY_PEER; break;
+                    /* client_once */
+                    case 0xAD50164A:
+                        verify_flag |= SSL_VERIFY_CLIENT_ONCE; break;
+                    /* fail_if_no_peer_cert */
+                    case 0x19CC9C49:
+                        verify_flag |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT; break;
+                }
+
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "options");
+        if (lua_istable(L, -1)) {
+
+            lua_pushnil(L); /* first item */
+            while (lua_next(L, -2) != 0) { /* iterate */
+                op = (u_char *) lua_tolstring(L, -1, &len);
+                options_flag |= ngx_http_lua_socket_ssl_option_handler(op, len);
+
+                lua_pop(L, 1);
+            }
+
+            SSL_CTX_clear_options(ssl->ctx, SSL_CTX_get_options(ssl->ctx));
+            SSL_CTX_set_options(ssl->ctx, options_flag);
+        }
+        lua_pop(L, 1);
+
+    }
+
+    if (ngx_ssl_create_connection(ssl, c, NGX_SSL_BUFFER|NGX_SSL_CLIENT)
+       != NGX_OK)
+    {
+        ngx_http_lua_socket_tcp_cleanup((void *) u);
+        return luaL_error(L, "unable to create SSL connection");
+    }
+
+    c->sendfile = 0;
+
+    if (u->reused) {
+        if (pc->set_session(pc, pc->data) != NGX_OK) {
+            ngx_http_lua_socket_tcp_cleanup((void *) u);
+            return luaL_error(L, "unable to re-use SSL session");
+        }
+    }
+
+    rc = ngx_ssl_handshake(c);
+
+    if (rc == NGX_AGAIN) {
+        c->ssl->handler = ngx_http_lua_socket_ssl_handshake;
+        return lua_yield(L, 1);
+    }
+
+    ngx_http_lua_socket_ssl_handshake(c);
+
+    return 1;
+}
+
+static long
+ngx_http_lua_socket_ssl_option_handler(u_char *s, size_t len)
+{
+    switch (ngx_murmur_hash2(s,len)) {
+        /* all */
+        case 0xE4F85B0B:
+            return SSL_OP_ALL;
+        /* no_sslv3 */
+        case 0x66503699:
+            return SSL_OP_NO_SSLv3;
+        /* no_tlsv1 */
+        case 0x6ECE117B:
+            return SSL_OP_NO_TLSv1;
+        /* no_sslv2 */
+        case 0x027DAB79:
+            return SSL_OP_NO_SSLv2;
+        /* no_ticket */
+        case 0x4A91B495:
+            return SSL_OP_NO_TICKET;
+#ifdef SSL_OP_NO_TLSv1_1
+        /* no_tlsv1_1 */
+        case 0xABA18F74:
+            return SSL_OP_NO_TLSv1_1;
+#endif
+        /* tls_d5_bug */
+        case 0xCDD26166:
+            return SSL_OP_TLS_D5_BUG;
+#ifdef SSL_OP_NO_TLSv1_2
+        /* no_tlsv1_2 */
+        case 0x081CC0CE:
+            return SSL_OP_NO_TLSv1_2;
+#endif
+        /* no_query_mtu */
+        case 0x65918DD8:
+            return SSL_OP_NO_QUERY_MTU;
+        /* pkcs1_check_2 */
+        case 0xDB3DA991:
+            return SSL_OP_PKCS1_CHECK_2;
+        /* pkcs1_check_1 */
+        case 0xDE4FB8B6:
+            return SSL_OP_PKCS1_CHECK_1;
+        /* ephemeral_rsa */
+        case 0xADD708CA:
+            return SSL_OP_EPHEMERAL_RSA;
+        /* single_dh_use */
+        case 0x06D218EF:
+            return SSL_OP_SINGLE_DH_USE;
+#ifdef SSL_OP_NO_COMPRESSION
+        /* no_compression */
+        case 0x82E6D9E3:
+            return SSL_OP_NO_COMPRESSION;
+#endif
+        /* single_ecdh_use */
+        case 0xBE9FA0B0:
+            return SSL_OP_SINGLE_ECDH_USE;
+        /* cookie_exchange */
+        case 0x1CC1C731:
+            return SSL_OP_COOKIE_EXCHANGE;
+        /* cisco_anyconnect */
+        case 0x8633592C:
+            return SSL_OP_CISCO_ANYCONNECT;
+        /* tls_rollback_bug */
+        case 0xE018911E:
+            return SSL_OP_TLS_ROLLBACK_BUG;
+        /* netscape_ca_dn_bug */
+        case 0xC6D68F70:
+            return SSL_OP_NETSCAPE_CA_DN_BUG;
+#ifdef SSL_OP_CRYPTOPRO_TLSEXT_BUG
+        /* cryptopro_tlsext_bug */
+        case 0x25B874EC:
+            return SSL_OP_CRYPTOPRO_TLSEXT_BUG;
+#endif
+        /* microsoft_sess_id_bug */
+        case 0x15D4092D:
+            return SSL_OP_MICROSOFT_SESS_ID_BUG;
+        /* legacy_server_connect */
+        case 0x1D9598C0:
+            return SSL_OP_LEGACY_SERVER_CONNECT;
+        /* tls_block_padding_bug */
+        case 0x1F4A61EF:
+            return SSL_OP_TLS_BLOCK_PADDING_BUG;
+        /* netscape_challenge_bug */
+        case 0xE0F30C1D:
+            return SSL_OP_NETSCAPE_CHALLENGE_BUG;
+        /* msie_sslv2_rsa_padding */
+        case 0x8FBA6916:
+            return SSL_OP_MSIE_SSLV2_RSA_PADDING;
+        /* cipher_server_preference */
+        case 0x0C0F84EE:
+            return SSL_OP_CIPHER_SERVER_PREFERENCE;
+        /* ssleay_080_client_dh_bug */
+        case 0xD8DC81E3:
+            return SSL_OP_SSLEAY_080_CLIENT_DH_BUG;
+        /* microsoft_big_sslv3_buffer */
+        case 0x37181231:
+            return SSL_OP_MICROSOFT_BIG_SSLV3_BUFFER;
+        /* dont_insert_empty_fragments */
+        case 0x5E3F859A:
+            return SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
+        /* sslref2_reuse_cert_type_bug */
+        case 0x3DB4F36A:
+            return SSL_OP_SSLREF2_REUSE_CERT_TYPE_BUG;
+        /* netscape_demo_cipher_change_bug */
+        case 0x56B43C8C:
+            return SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG;
+        /* netscape_reuse_cipher_change_bug */
+        case 0x7490F66D:
+            return SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG;
+        /* allow_unsafe_legacy_renegotiation */
+        case 0x4BE9DC8B:
+            return SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION;
+        /* no_session_resumption_on_renegotiation */
+        case 0xAA9ED5E3:
+            return SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
+        default:
+            return 0;
+    }
+}
+
+static void
+ngx_http_lua_socket_ssl_handshake(ngx_connection_t *c)
+{
+    ngx_http_lua_socket_tcp_upstream_t  *u;
+    ngx_peer_connection_t           *pc;
+
+    u = c->data;
+    pc = &u->peer;
+
+
+    if (c->ssl->handshaked) {
+        u->peer.save_session(pc, pc->data);
+
+        c->write->handler = ngx_http_lua_socket_tcp_handler;
+        c->read->handler = ngx_http_lua_socket_tcp_handler;
+    }
+
+}
+
+#endif
 
 
 static void
@@ -2347,6 +2701,14 @@ ngx_http_lua_socket_tcp_finalize(ngx_http_request_t *r,
     }
 
     if (u->peer.connection) {
+
+#if (NGX_SSL)
+        if (u->peer.connection->ssl) {
+            u->peer.connection->ssl->no_wait_shutdown = 1;
+
+            (void) ngx_ssl_shutdown(u->peer.connection);
+        }
+#endif
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "lua close socket connection");
 
